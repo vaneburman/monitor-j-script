@@ -1,7 +1,9 @@
 # jira_metrics_exporter.py
 #
-# Versión Final y Definitiva. El archivo prometheus_pb2.py es generado por build.sh
-# a partir de una versión limpia y compatible de prometheus.proto.
+# Versión Final y Completa:
+# 1. Mide el desempeño de Desarrolladores y QA (tiempos de ciclo, retrabajo).
+# 2. Envía alertas en tiempo real para tickets críticos y comentarios nuevos.
+# 3. Envía todas las métricas a Grafana Cloud usando el formato Remote Write.
 #
 import os
 import time
@@ -10,13 +12,13 @@ import threading
 from datetime import datetime, date, timedelta
 import requests
 from jira import JIRA
-from prometheus_client import CollectorRegistry, Gauge
+# Se importan todos los tipos de métricas necesarios
+from prometheus_client import CollectorRegistry, Gauge, Histogram, Counter, Summary
 from dotenv import load_dotenv
 from flask import Flask
 
 # --- Librerías para el formato Remote Write ---
 import snappy
-# Este import ahora funcionará porque build.sh crea el archivo
 from prometheus_pb2 import WriteRequest, TimeSeries, Label, Sample
 
 # --- Configuración Inicial ---
@@ -33,25 +35,34 @@ GRAFANA_PUSH_URL = os.getenv('GRAFANA_PUSH_URL')
 GRAFANA_INSTANCE_ID = os.getenv('GRAFANA_CLOUD_INSTANCE_ID')
 GRAFANA_API_KEY = os.getenv('GRAFANA_CLOUD_API_KEY')
 
-# --- Lista de Usuarios Internos ---
-DEFAULT_INTERNAL_USERS = [
-    "Marcelo Santini", "Vanesa Burman", "Francisco Ziegler",
-    "Franco Murabito", "Rodrigo Perdomo", "Benjamin Gonzalez"
-]
-INTERNAL_USERS_STR = os.getenv("INTERNAL_USERS")
-INTERNAL_USERS = [name.strip() for name in INTERNAL_USERS_STR.split(',')] if INTERNAL_USERS_STR else DEFAULT_INTERNAL_USERS
-logging.info(f"Usuarios internos configurados: {INTERNAL_USERS}")
+# --- Listas de Equipo ---
+DEVELOPERS = ["Rodrigo Perdomo", "Benjamin Gonzalez", "Francisco Ziegler", "Franco Murabito", "Vanesa Burman"]
+QA_TEAM = ["Agustin Godoy"]
+INTERNAL_USERS = DEVELOPERS + QA_TEAM + ["Marcelo Santini"] # Se combinan para la lógica de alertas
+logging.info(f"Equipo de Desarrollo a medir: {DEVELOPERS}")
+logging.info(f"Equipo de QA a medir: {QA_TEAM}")
+logging.info(f"Usuarios internos (no generan alertas de comentario): {INTERNAL_USERS}")
+
 
 ALERTED_TICKETS = {"new_comment": {}}
 
 # --- Funciones Auxiliares ---
-def count_business_days(start_date_str):
+def business_hours_between(start_dt, end_dt):
+    """Calcula las horas hábiles entre dos datetimes."""
+    days = 0
+    current_date = start_dt.date()
+    while current_date <= end_dt.date():
+        if current_date.weekday() < 5: # Lunes a Viernes
+            days += 1
+        current_date += timedelta(days=1)
+    return days * 8
+
+def parse_jira_date(date_str):
+    """Parsea fechas de Jira que pueden tener diferentes formatos."""
     try:
-        start_date = datetime.strptime(start_date_str, '%Y-%m-%dT%H:%M:%S.%f%z').date()
+        return datetime.strptime(date_str, '%Y-%m-%dT%H:%M:%S.%f%z')
     except ValueError:
-        start_date = datetime.strptime(start_date_str, '%Y-%m-%dT%H:%M:%S%z').date()
-    today = date.today()
-    return len([d for d in (start_date + timedelta(days=i) for i in range((today - start_date).days)) if d.weekday() < 5])
+        return datetime.strptime(date_str, '%Y-%m-%dT%H:%M:%S%z')
 
 def send_alert(message):
     if not GMAIL_CHAT_WEBHOOK: return
@@ -60,99 +71,84 @@ def send_alert(message):
         logging.info("Alerta enviada correctamente.")
     except requests.exceptions.RequestException as e:
         logging.error(f"Error al enviar la alerta: {e}")
-        
-# --- Función de Envío Correcta ---
+
+# --- Función de Envío (sin cambios) ---
 def send_to_grafana_remote_write(registry):
-    """Convierte métricas al formato Protobuf, las comprime con Snappy y las envía."""
     metric_families = registry.collect()
     write_request = WriteRequest()
-    
     for family in metric_families:
         for s in family.samples:
-            time_series = TimeSeries()
-            time_series.labels.append(Label(name="__name__", value=s.name))
-            for label_name, label_value in s.labels.items():
-                time_series.labels.append(Label(name=label_name, value=label_value))
-            timestamp_ms = int(time.time() * 1000)
-            time_series.samples.append(Sample(value=s.value, timestamp=timestamp_ms))
-            write_request.timeseries.append(time_series)
-
-    uncompressed_data = write_request.SerializeToString()
-    compressed_data = snappy.compress(uncompressed_data)
-
-    headers = {
-        'Content-Type': 'application/x-protobuf',
-        'Content-Encoding': 'snappy',
-        'X-Prometheus-Remote-Write-Version': '0.1.0'
-    }
-    
-    logging.info(f"Enviando {len(compressed_data)} bytes de datos comprimidos a: {GRAFANA_PUSH_URL}")
-    response = requests.post(
-        url=GRAFANA_PUSH_URL,
-        auth=(GRAFANA_INSTANCE_ID, GRAFANA_API_KEY),
-        data=compressed_data,
-        headers=headers
-    )
+            ts = TimeSeries(labels=[Label(name="__name__", value=s.name)])
+            for ln, lv in s.labels.items(): ts.labels.append(Label(name=ln, value=lv))
+            ts.samples.append(Sample(value=s.value, timestamp=int(time.time() * 1000)))
+            write_request.timeseries.append(ts)
+    compressed_data = snappy.compress(write_request.SerializeToString())
+    headers = {'Content-Type': 'application/x-protobuf', 'Content-Encoding': 'snappy', 'X-Prometheus-Remote-Write-Version': '0.1.0'}
+    response = requests.post(url=GRAFANA_PUSH_URL, auth=(GRAFANA_INSTANCE_ID, GRAFANA_API_KEY), data=compressed_data, headers=headers)
     response.raise_for_status()
-
 
 # --- Lógica Principal de Métricas y Alertas ---
 def metrics_and_alerts_loop():
     logging.info("Iniciando hilo de recolección de métricas...")
     
-    if not all([JIRA_SERVER, JIRA_USER, JIRA_API_TOKEN, GRAFANA_PUSH_URL, GRAFANA_INSTANCE_ID, GRAFANA_API_KEY]):
-        logging.critical("Error en hilo de fondo: Faltan variables de entorno críticas. El hilo se detendrá.")
-        return
-
     try:
         jira_client = JIRA(server=JIRA_SERVER, basic_auth=(JIRA_USER, JIRA_API_TOKEN))
-        logging.info("Conexión con Jira establecida en hilo de fondo.")
+        logging.info("Conexión con Jira establecida.")
     except Exception as e:
-        logging.critical(f"No se pudo conectar a Jira en hilo de fondo: {e}. El hilo se detendrá.")
+        logging.critical(f"No se pudo conectar a Jira: {e}. El hilo se detendrá.")
         return
 
     while True:
-        logging.info("Iniciando ciclo de recolección...")
+        logging.info("Iniciando ciclo de recolección de desempeño...")
         registry = CollectorRegistry()
-        METRICS = {
-            'paused_overdue': Gauge('jira_tickets_paused_overdue', 'Tickets en Pausa por más de 5 días hábiles', registry=registry),
-            'inprogress_overdue': Gauge('jira_tickets_inprogress_overdue', 'Tickets En Curso por más de 3 días hábiles', ['assignee'], registry=registry),
-            'pending_arq_overdue': Gauge('jira_tickets_pending_arq_overdue', 'Tickets en Pendiente ARQ/TL por más de 1 día hábil', registry=registry),
-            'ready_for_prod': Gauge('jira_tickets_ready_for_prod', 'Tickets en estado LISTO PARA PROD', registry=registry),
-            'uat': Gauge('jira_tickets_uat', 'Tickets en estado UAT o Pruebas Cliente', registry=registry)
-        }
         
+        # --- MÉTRICAS DE DESEMPEÑO DE DESARROLLADORES ---
+        dev_tickets_in_progress = Gauge('dev_tickets_in_progress_count', 'Cantidad de tickets en curso por desarrollador', ['developer'], registry=registry)
+        dev_cycle_time = Summary('dev_cycle_time_hours', 'Tiempo (en horas hábiles) desde que un ticket pasa a "En Curso" hasta "Listo para Prod"', ['developer'], registry=registry)
+        dev_rework_count = Counter('dev_rework_total', 'Cantidad de veces que un ticket vuelve de Test/ARQ a En Curso', ['developer'], registry=registry)
+
+        # --- MÉTRICAS DE DESEMPEÑO DE QA ---
+        qa_cycle_time = Histogram('qa_testing_time_days', 'Tiempo (en días hábiles) que un ticket pasa en Test', buckets=[1, 3, float('inf')], registry=registry)
+
         try:
-            # Lógica de recolección de métricas
-            jql_paused = f'project = {PROJECT_KEY} AND status = "EN PAUSA"'
-            paused_tickets = jira_client.search_issues(jql_paused, maxResults=100)
-            METRICS['paused_overdue'].set(sum(1 for t in paused_tickets if count_business_days(t.fields.updated) > 5))
-            
-            METRICS['inprogress_overdue'].clear()
-            jql_inprogress = f'project = {PROJECT_KEY} AND status = "EN CURSO"'
-            inprogress_tickets = jira_client.search_issues(jql_inprogress, expand="changelog", maxResults=100)
-            for ticket in inprogress_tickets:
-                for history in reversed(ticket.changelog.histories):
+            # --- Lógica para Desarrolladores ---
+            for dev_name in DEVELOPERS:
+                jql_current = f'project = {PROJECT_KEY} AND status = "EN CURSO" AND assignee = "{dev_name}"'
+                dev_tickets_in_progress.labels(developer=dev_name).set(jira_client.search_issues(jql_current, maxResults=0).total)
+
+                jql_closed = f'project = {PROJECT_KEY} AND status changed to "Listo para Prod" by ("{dev_name}") after -7d'
+                closed_issues = jira_client.search_issues(jql_closed, expand="changelog", maxResults=100)
+
+                for issue in closed_issues:
+                    in_progress_time, ready_for_prod_time, rework_events = None, None, 0
+                    for history in issue.changelog.histories:
+                        for item in history.items:
+                            if item.field == 'status':
+                                if item.toString == 'EN CURSO': in_progress_time = parse_jira_date(history.created)
+                                if item.toString == 'Listo para Prod' and not ready_for_prod_time: ready_for_prod_time = parse_jira_date(history.created)
+                                if item.fromString in ['Test', 'In Progress C'] and item.toString == 'EN CURSO': rework_events += 1
+                    if in_progress_time and ready_for_prod_time:
+                        dev_cycle_time.labels(developer=dev_name).observe(business_hours_between(in_progress_time, ready_for_prod_time))
+                    if rework_events > 0: dev_rework_count.labels(developer=dev_name).inc(rework_events)
+
+            # --- Lógica para QA (Agustín Godoy) ---
+            jql_qa_done = f'project = {PROJECT_KEY} AND status changed from "Test" by ("Agustin Godoy") after -7d'
+            qa_done_issues = jira_client.search_issues(jql_qa_done, expand="changelog", maxResults=100)
+            for issue in qa_done_issues:
+                test_start_time, test_end_time = None, None
+                for history in reversed(issue.changelog.histories):
                     for item in history.items:
-                        if item.field == 'status' and item.toString == 'EN CURSO':
-                            change_date = history.created
-                            if count_business_days(change_date) > 3:
-                                assignee = getattr(ticket.fields.assignee, 'displayName', 'No Asignado')
-                                METRICS['inprogress_overdue'].labels(assignee=assignee).inc()
-                            break
-                    else: continue
-                    break
+                        if item.field == 'status':
+                            if item.toString == 'Test' and not test_start_time: test_start_time = parse_jira_date(history.created)
+                            if item.fromString == 'Test' and test_start_time and not test_end_time: test_end_time = parse_jira_date(history.created)
+                if test_start_time and test_end_time:
+                    qa_cycle_time.observe(business_hours_between(test_start_time, test_end_time) / 8)
 
-            jql_arq = f'project = {PROJECT_KEY} AND status = "In Progress C"'
-            arq_tickets = jira_client.search_issues(jql_arq, maxResults=100)
-            METRICS['pending_arq_overdue'].set(sum(1 for t in arq_tickets if count_business_days(t.fields.updated) > 1))
+            logging.info("Recolección de métricas de desempeño completada.")
             
-            METRICS['ready_for_prod'].set(jira_client.search_issues(f'project = {PROJECT_KEY} AND status = "IN PROGRESS D"', maxResults=0).total)
-            METRICS['uat'].set(jira_client.search_issues(f'project = {PROJECT_KEY} AND status = "UAT"', maxResults=0).total)
-
-            logging.info("Recolección de métricas completada.")
-            
-            # --- LÓGICA DE ALERTAS COMPLETA ---
+            # --- LÓGICA DE ALERTAS EN TIEMPO REAL (RESTAURADA) ---
+            logging.info("Buscando alertas en tiempo real...")
+            # Alerta de Nuevos Tickets Críticos
             jql_new_critical = f'project = {PROJECT_KEY} AND priority in (Highest, High) AND created >= "-5m"'
             new_critical_tickets = jira_client.search_issues(jql_new_critical)
             for ticket in new_critical_tickets:
@@ -163,6 +159,7 @@ def metrics_and_alerts_loop():
                                   f"*Componente:* {component}")
                  send_alert(alert_message)
 
+            # Alerta de Nuevos Comentarios de Externos
             jql_critical_updated = f'project = {PROJECT_KEY} AND priority in (Highest, High) AND updated >= "-5m"'
             critical_updated_tickets = jira_client.search_issues(jql_critical_updated)
             for ticket in critical_updated_tickets:
@@ -176,15 +173,16 @@ def metrics_and_alerts_loop():
                                          f"*Autor del Comentario:* {author_display_name}")
                         send_alert(alert_message)
                         ALERTED_TICKETS["new_comment"][ticket.key] = last_comment.id
+            logging.info("Búsqueda de alertas finalizada.")
 
-            # --- Lógica de envío final ---
+            # --- Lógica de envío ---
             send_to_grafana_remote_write(registry)
-            logging.info("Métricas enviadas con éxito.")
+            logging.info("Métricas de desempeño enviadas con éxito.")
 
         except Exception as e:
             logging.error(f"Error durante el ciclo de recolección/envío: {e}", exc_info=True)
 
-        logging.info("Ciclo completado. Durmiendo por 300 segundos...")
+        logging.info("Ciclo de desempeño completado. Durmiendo por 300 segundos...")
         time.sleep(300)
 
 # --- Configuración del Servidor Web Flask ---
@@ -198,6 +196,6 @@ if __name__ == '__main__':
     metrics_thread = threading.Thread(target=metrics_and_alerts_loop, daemon=True)
     metrics_thread.start()
     port = int(os.environ.get('PORT', 10000))
-    logging.info(f"Iniciando servidor web en el puerto {port} para los health checks de Render...")
+    logging.info(f"Iniciando servidor web en el puerto {port}...")
     app.run(host='0.0.0.0', port=port)
 
