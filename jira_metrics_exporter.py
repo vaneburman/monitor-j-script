@@ -172,7 +172,7 @@ def metrics_collection_loop(jira_client):
         qa_cycle_time = Histogram(
             'qa_testing_time_days', 
             'Tiempo en estado Test (días)', 
-            buckets=[0.5, 1, 2, 3, 5, float('inf')], 
+            buckets=[1, 2, 3, 5, float('inf')], 
             registry=registry
         )
 
@@ -182,7 +182,7 @@ def metrics_collection_loop(jira_client):
             
             for acc_id, dev_name in DEVELOPER_MAP.items():
                 # 1. Tickets en curso
-                jql_current = f'project = {PROJECT_KEY} AND status = "EN CURSO" AND assignee = "{acc_id}"'
+                jql_current = f'project = {PROJECT_KEY} AND status = "In Progress" AND assignee = "{acc_id}"'
                 current_tickets = jira_client.search_issues(jql_current, maxResults=50)
                 ticket_count = len(current_tickets)
                 
@@ -197,7 +197,7 @@ def metrics_collection_loop(jira_client):
                         changelog = jira_client.issue(ticket.key, expand='changelog').changelog
                         for history in reversed(changelog.histories):
                             for item in history.items:
-                                if item.field == 'status' and item.toString == 'EN CURSO':
+                                if item.field == 'status' and item.toString == 'In Progress':
                                     start_time = parse_jira_date(history.created)
                                     hours_in_progress = (datetime.now(start_time.tzinfo) - start_time).total_seconds() / 3600
                                     total_hours += hours_in_progress
@@ -218,11 +218,11 @@ def metrics_collection_loop(jira_client):
                     for history in issue.changelog.histories:
                         for item in history.items:
                             if item.field == 'status':
-                                if item.toString == 'EN CURSO':
+                                if item.toString == 'In Progress':
                                     in_progress_time = parse_jira_date(history.created)
-                                if item.toString == 'Listo para Prod' and not ready_for_prod_time:
+                                if item.toString == 'IN PROGRESS D' and not ready_for_prod_time:
                                     ready_for_prod_time = parse_jira_date(history.created)
-                                if item.fromString in ['Test', 'In Progress C'] and item.toString == 'EN CURSO':
+                                if item.fromString in ['TEST', 'In Progress C'] and item.toString == 'In Progress':
                                     rework_events += 1
                     
                     if in_progress_time and ready_for_prod_time:
@@ -237,7 +237,7 @@ def metrics_collection_loop(jira_client):
             
             if QA_MAP:
                 qa_account_ids = ', '.join(f'"{acc_id}"' for acc_id in QA_MAP.keys())
-                jql_qa_done = f'project = {PROJECT_KEY} AND status changed from "Test" by ({qa_account_ids}) after -7d'
+                jql_qa_done = f'project = {PROJECT_KEY} AND status changed from "TEST" by ({qa_account_ids}) after -7d'
                 qa_done_issues = jira_client.search_issues(jql_qa_done, expand="changelog", maxResults=100)
                 
                 logging.info(f"  📈 QA: {len(qa_done_issues)} tickets procesados en 7 días")
@@ -247,9 +247,9 @@ def metrics_collection_loop(jira_client):
                     for history in reversed(issue.changelog.histories):
                         for item in history.items:
                             if item.field == 'status':
-                                if item.toString == 'Test' and not test_start_time:
+                                if item.toString == 'TEST' and not test_start_time:
                                     test_start_time = parse_jira_date(history.created)
-                                if item.fromString == 'Test' and test_start_time and not test_end_time:
+                                if item.fromString == 'TEST' and test_start_time and not test_end_time:
                                     test_end_time = parse_jira_date(history.created)
                     
                     if test_start_time and test_end_time:
