@@ -3,3 +3,5 @@ prometheus-client
 python-dotenv
 requests
 Flask
+protobuf==3.20.3
+python-snappy
