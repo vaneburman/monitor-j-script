@@ -1,9 +1,8 @@
 # jira_metrics_exporter.py
 #
-# Versión Final y Completa:
-# 1. Mide el desempeño de Desarrolladores y QA (tiempos de ciclo, retrabajo).
-# 2. Envía alertas en tiempo real para tickets críticos y comentarios nuevos.
-# 3. Envía todas las métricas a Grafana Cloud usando el formato Remote Write.
+# Versión Final y Autónoma.
+# El script lee una lista de NOMBRES de desarrolladores y busca sus Account IDs
+# automáticamente al iniciar, para luego usarlos en las consultas.
 #
 import os
 import time
@@ -12,7 +11,6 @@ import threading
 from datetime import datetime, date, timedelta
 import requests
 from jira import JIRA
-# Se importan todos los tipos de métricas necesarios
 from prometheus_client import CollectorRegistry, Gauge, Histogram, Counter, Summary
 from dotenv import load_dotenv
 from flask import Flask
@@ -36,29 +34,19 @@ GRAFANA_INSTANCE_ID = os.getenv('GRAFANA_CLOUD_INSTANCE_ID')
 GRAFANA_API_KEY = os.getenv('GRAFANA_CLOUD_API_KEY')
 
 # --- Listas de Equipo ---
-DEVELOPERS = ["Rodrigo Perdomo", "Benjamin Gonzalez", "Francisco Ziegler", "Franco Murabito", "Vanesa Burman"]
+# ¡MODIFICADO! Leemos la lista de nombres de desarrolladores desde una variable de entorno.
+DEVELOPER_NAMES_STR = os.getenv("DEVELOPER_LIST")
 QA_TEAM = ["Agustin Godoy"]
-INTERNAL_USERS = DEVELOPERS + QA_TEAM + ["Marcelo Santini"] # Se combinan para la lógica de alertas
-logging.info(f"Equipo de Desarrollo a medir: {DEVELOPERS}")
-logging.info(f"Equipo de QA a medir: {QA_TEAM}")
-logging.info(f"Usuarios internos (no generan alertas de comentario): {INTERNAL_USERS}")
-
+DEVELOPER_MAP = {} # Este mapa se llenará automáticamente
 
 ALERTED_TICKETS = {"new_comment": {}}
 
 # --- Funciones Auxiliares ---
 def business_hours_between(start_dt, end_dt):
-    """Calcula las horas hábiles entre dos datetimes."""
-    days = 0
-    current_date = start_dt.date()
-    while current_date <= end_dt.date():
-        if current_date.weekday() < 5: # Lunes a Viernes
-            days += 1
-        current_date += timedelta(days=1)
+    days = sum(1 for i in range((end_dt.date() - start_dt.date()).days + 1) if (start_dt.date() + timedelta(days=i)).weekday() < 5)
     return days * 8
 
 def parse_jira_date(date_str):
-    """Parsea fechas de Jira que pueden tener diferentes formatos."""
     try:
         return datetime.strptime(date_str, '%Y-%m-%dT%H:%M:%S.%f%z')
     except ValueError:
@@ -72,7 +60,7 @@ def send_alert(message):
     except requests.exceptions.RequestException as e:
         logging.error(f"Error al enviar la alerta: {e}")
 
-# --- Función de Envío (sin cambios) ---
+# --- Función de Envío ---
 def send_to_grafana_remote_write(registry):
     metric_families = registry.collect()
     write_request = WriteRequest()
@@ -88,35 +76,29 @@ def send_to_grafana_remote_write(registry):
     response.raise_for_status()
 
 # --- Lógica Principal de Métricas y Alertas ---
-def metrics_and_alerts_loop():
-    logging.info("Iniciando hilo de recolección de métricas...")
+def metrics_and_alerts_loop(jira_client, developer_map):
+    """Bucle principal que se ejecuta con el cliente de Jira y el mapa de desarrolladores ya inicializados."""
     
-    try:
-        jira_client = JIRA(server=JIRA_SERVER, basic_auth=(JIRA_USER, JIRA_API_TOKEN))
-        logging.info("Conexión con Jira establecida.")
-    except Exception as e:
-        logging.critical(f"No se pudo conectar a Jira: {e}. El hilo se detendrá.")
-        return
+    # Construye la lista de usuarios internos una sola vez
+    internal_users = list(developer_map.values()) + QA_TEAM + ["Marcelo Santini"]
+    logging.info(f"Usuarios internos (no generan alertas): {internal_users}")
 
     while True:
         logging.info("Iniciando ciclo de recolección de desempeño...")
         registry = CollectorRegistry()
         
-        # --- MÉTRICAS DE DESEMPEÑO DE DESARROLLADORES ---
         dev_tickets_in_progress = Gauge('dev_tickets_in_progress_count', 'Cantidad de tickets en curso por desarrollador', ['developer'], registry=registry)
-        dev_cycle_time = Summary('dev_cycle_time_hours', 'Tiempo (en horas hábiles) desde que un ticket pasa a "En Curso" hasta "Listo para Prod"', ['developer'], registry=registry)
+        dev_cycle_time = Summary('dev_cycle_time_hours', 'Tiempo (en horas hábiles) desde "En Curso" hasta "Listo para Prod"', ['developer'], registry=registry)
         dev_rework_count = Counter('dev_rework_total', 'Cantidad de veces que un ticket vuelve de Test/ARQ a En Curso', ['developer'], registry=registry)
-
-        # --- MÉTRICAS DE DESEMPEÑO DE QA ---
         qa_cycle_time = Histogram('qa_testing_time_days', 'Tiempo (en días hábiles) que un ticket pasa en Test', buckets=[1, 3, float('inf')], registry=registry)
 
         try:
-            # --- Lógica para Desarrolladores ---
-            for dev_name in DEVELOPERS:
-                jql_current = f'project = {PROJECT_KEY} AND status = "EN CURSO" AND assignee = "{dev_name}"'
+            # --- Lógica para Desarrolladores usando el mapa de Account IDs ---
+            for acc_id, dev_name in developer_map.items():
+                jql_current = f'project = {PROJECT_KEY} AND status = "EN CURSO" AND assignee = "{acc_id}"'
                 dev_tickets_in_progress.labels(developer=dev_name).set(jira_client.search_issues(jql_current, maxResults=0).total)
 
-                jql_closed = f'project = {PROJECT_KEY} AND status changed to "Listo para Prod" by ("{dev_name}") after -7d'
+                jql_closed = f'project = {PROJECT_KEY} AND status changed to "Listo para Prod" AND assignee = "{acc_id}" AND updated >= -7d'
                 closed_issues = jira_client.search_issues(jql_closed, expand="changelog", maxResults=100)
 
                 for issue in closed_issues:
@@ -131,7 +113,7 @@ def metrics_and_alerts_loop():
                         dev_cycle_time.labels(developer=dev_name).observe(business_hours_between(in_progress_time, ready_for_prod_time))
                     if rework_events > 0: dev_rework_count.labels(developer=dev_name).inc(rework_events)
 
-            # --- Lógica para QA (Agustín Godoy) ---
+            # --- Lógica para QA ---
             jql_qa_done = f'project = {PROJECT_KEY} AND status changed from "Test" by ("Agustin Godoy") after -7d'
             qa_done_issues = jira_client.search_issues(jql_qa_done, expand="changelog", maxResults=100)
             for issue in qa_done_issues:
@@ -146,9 +128,8 @@ def metrics_and_alerts_loop():
 
             logging.info("Recolección de métricas de desempeño completada.")
             
-            # --- LÓGICA DE ALERTAS EN TIEMPO REAL (RESTAURADA) ---
+            # --- Lógica de Alertas en Tiempo Real ---
             logging.info("Buscando alertas en tiempo real...")
-            # Alerta de Nuevos Tickets Críticos
             jql_new_critical = f'project = {PROJECT_KEY} AND priority in (Highest, High) AND created >= "-5m"'
             new_critical_tickets = jira_client.search_issues(jql_new_critical)
             for ticket in new_critical_tickets:
@@ -159,7 +140,6 @@ def metrics_and_alerts_loop():
                                   f"*Componente:* {component}")
                  send_alert(alert_message)
 
-            # Alerta de Nuevos Comentarios de Externos
             jql_critical_updated = f'project = {PROJECT_KEY} AND priority in (Highest, High) AND updated >= "-5m"'
             critical_updated_tickets = jira_client.search_issues(jql_critical_updated)
             for ticket in critical_updated_tickets:
@@ -167,7 +147,7 @@ def metrics_and_alerts_loop():
                 if comments:
                     last_comment = comments[-1]
                     author_display_name = last_comment.author.displayName
-                    if author_display_name not in INTERNAL_USERS and ALERTED_TICKETS["new_comment"].get(ticket.key) != last_comment.id:
+                    if author_display_name not in internal_users and ALERTED_TICKETS["new_comment"].get(ticket.key) != last_comment.id:
                         alert_message = (f"⚠️ *Nuevo Comentario importante en Ticket Crítico*\n\n"
                                          f"<{JIRA_SERVER}/browse/{ticket.key}|{ticket.key}> - *{ticket.fields.summary}*\n"
                                          f"*Autor del Comentario:* {author_display_name}")
@@ -191,10 +171,41 @@ app = Flask(__name__)
 def hello_world():
     return 'El worker de métricas de Jira está corriendo en segundo plano. ¡Todo OK!'
 
-# --- Bucle Principal ---
+# --- Bucle Principal de Arranque ---
 if __name__ == '__main__':
-    metrics_thread = threading.Thread(target=metrics_and_alerts_loop, daemon=True)
+    # 1. Conectar a Jira una sola vez
+    try:
+        jira_client = JIRA(server=JIRA_SERVER, basic_auth=(JIRA_USER, JIRA_API_TOKEN))
+        logging.info("Conexión principal con Jira establecida.")
+    except Exception as e:
+        logging.critical(f"No se pudo establecer la conexión inicial con Jira: {e}")
+        exit(1)
+
+    # 2. Construir el mapa de desarrolladores automáticamente
+    developer_map = {}
+    if DEVELOPER_NAMES_STR:
+        developer_names = [name.strip() for name in DEVELOPER_NAMES_STR.split(',')]
+        logging.info(f"Buscando Account IDs para: {developer_names}")
+        for name in developer_names:
+            try:
+                # La función search_users es la forma correcta de encontrar usuarios
+                users = jira_client.search_users(query=name, maxResults=1)
+                if users:
+                    user = users[0]
+                    developer_map[user.accountId] = user.displayName
+                    logging.info(f"  -> Encontrado: '{user.displayName}' -> {user.accountId}")
+                else:
+                    logging.warning(f"  -> No se encontró ningún usuario para el nombre: '{name}'")
+            except Exception as e:
+                logging.error(f"Error buscando al usuario '{name}': {e}")
+    else:
+        logging.warning("La variable de entorno DEVELOPER_LIST está vacía. No se medirán métricas de desarrollador.")
+
+    # 3. Iniciar el hilo de fondo con los datos ya listos
+    metrics_thread = threading.Thread(target=metrics_and_alerts_loop, args=(jira_client, developer_map), daemon=True)
     metrics_thread.start()
+
+    # 4. Iniciar el servidor web
     port = int(os.environ.get('PORT', 10000))
     logging.info(f"Iniciando servidor web en el puerto {port}...")
     app.run(host='0.0.0.0', port=port)
