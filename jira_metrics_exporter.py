@@ -1,7 +1,7 @@
 # jira_metrics_exporter.py
 #
 # Versión Final y Definitiva. El archivo prometheus_pb2.py es generado por build.sh
-# para asegurar compatibilidad y seguir la especificación del Remote Write Endpoint.
+# a partir de una versión limpia y compatible de prometheus.proto.
 #
 import os
 import time
@@ -18,8 +18,6 @@ from flask import Flask
 import snappy
 # Este import ahora funcionará porque build.sh crea el archivo
 from prometheus_pb2 import WriteRequest, TimeSeries, Label, Sample
-# Este import es requerido por el .proto completo
-import gogo_pb2
 
 # --- Configuración Inicial ---
 load_dotenv() 
