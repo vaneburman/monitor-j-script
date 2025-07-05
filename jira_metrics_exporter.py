@@ -93,7 +93,7 @@ def process_metrics(jira):
     logging.info("Iniciando recolección de métricas de Jira...")
     try:
         # Métrica 1: Tickets en Pausa (> 5 días hábiles)
-        jql_paused = f'project = {PROJECT_KEY} AND status IN ("EN PAUSA", "PENDIENTE CLIENTE")'
+        jql_paused = f'project = {PROJECT_KEY} AND status = "EN PAUSA"'
         paused_tickets = jira.search_issues(jql_paused, maxResults=100)
         overdue_paused_count = sum(1 for t in paused_tickets if count_business_days(t.fields.updated) > 5)
         METRICS['paused_overdue'].set(overdue_paused_count)
@@ -116,15 +116,15 @@ def process_metrics(jira):
                 break
 
         # Métrica 3: Tickets Pendiente ARQ/TL (> 1 día hábil) y Alerta
-        jql_arq = f'project = {PROJECT_KEY} AND status IN ("In Progress C", "PENDIENTE TL - ARQ")'
+        jql_arq = f'project = {PROJECT_KEY} AND status = "In Progress C"'
         arq_tickets = jira.search_issues(jql_arq, maxResults=100)
         overdue_arq_count = sum(1 for t in arq_tickets if count_business_days(t.fields.updated) > 1)
         METRICS['pending_arq_overdue'].set(overdue_arq_count)
         # (La lógica de alerta se mantiene igual)
 
         # Métricas 4 y 5: Conteos simples
-        METRICS['ready_for_prod'].set(jira.search_issues(f'project = {PROJECT_KEY} AND status IN ("IN PROGRESS D", "LISTO PARA PROD")', maxResults=0).total)
-        METRICS['uat'].set(jira.search_issues(f'project = {PROJECT_KEY} AND status IN ("UAT", "CHECK CLIENTE")', maxResults=0).total)
+        METRICS['ready_for_prod'].set(jira.search_issues(f'project = {PROJECT_KEY} AND status = "IN PROGRESS D"', maxResults=0).total)
+        METRICS['uat'].set(jira.search_issues(f'project = {PROJECT_KEY} AND status = "UAT"', maxResults=0).total)
 
         logging.info("Recolección de métricas completada.")
 
