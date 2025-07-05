@@ -1,6 +1,6 @@
 # jira_metrics_exporter.py
 #
-# Versión Final, Completa y Robusta con Envío en Formato Correcto y Alertas
+# Versión Final y Definitiva. Usa prometheus-api-client para un envío robusto.
 #
 import os
 import time
@@ -13,10 +13,8 @@ from prometheus_client import CollectorRegistry, Gauge
 from dotenv import load_dotenv
 from flask import Flask
 
-# --- Librerías para el formato Remote Write ---
-import snappy
-# Importa las clases desde el archivo prometheus_pb2.py que creamos en el proyecto
-from prometheus_pb2 import WriteRequest, TimeSeries, Label, Sample
+# --- La librería correcta para el trabajo ---
+from prometheus_api_client import PrometheusConnect
 
 # --- Configuración Inicial ---
 load_dotenv() 
@@ -43,7 +41,7 @@ logging.info(f"Usuarios internos configurados: {INTERNAL_USERS}")
 
 ALERTED_TICKETS = {"new_comment": {}}
 
-# --- Funciones Auxiliares ---
+# --- Funciones Auxiliares (sin cambios) ---
 def count_business_days(start_date_str):
     try:
         start_date = datetime.strptime(start_date_str, '%Y-%m-%dT%H:%M:%S.%f%z').date()
@@ -59,41 +57,6 @@ def send_alert(message):
         logging.info("Alerta enviada correctamente.")
     except requests.exceptions.RequestException as e:
         logging.error(f"Error al enviar la alerta: {e}")
-        
-# --- Nueva Función de Envío Correcta ---
-def send_to_grafana_remote_write(registry):
-    """Convierte métricas al formato Protobuf, las comprime con Snappy y las envía."""
-    metric_families = registry.collect()
-    write_request = WriteRequest()
-    
-    for family in metric_families:
-        for s in family.samples:
-            time_series = TimeSeries()
-            time_series.labels.append(Label(name="__name__", value=s.name))
-            for label_name, label_value in s.labels.items():
-                time_series.labels.append(Label(name=label_name, value=label_value))
-            timestamp_ms = int(time.time() * 1000)
-            time_series.samples.append(Sample(value=s.value, timestamp=timestamp_ms))
-            write_request.timeseries.append(time_series)
-
-    uncompressed_data = write_request.SerializeToString()
-    compressed_data = snappy.compress(uncompressed_data)
-
-    headers = {
-        'Content-Type': 'application/x-protobuf',
-        'Content-Encoding': 'snappy',
-        'X-Prometheus-Remote-Write-Version': '0.1.0'
-    }
-    
-    logging.info(f"Enviando {len(compressed_data)} bytes de datos comprimidos a: {GRAFANA_PUSH_URL}")
-    response = requests.post(
-        url=GRAFANA_PUSH_URL,
-        auth=(GRAFANA_INSTANCE_ID, GRAFANA_API_KEY),
-        data=compressed_data,
-        headers=headers
-    )
-    response.raise_for_status()
-
 
 # --- Lógica Principal de Métricas y Alertas ---
 def metrics_and_alerts_loop():
@@ -103,11 +66,16 @@ def metrics_and_alerts_loop():
         logging.critical("Error en hilo de fondo: Faltan variables de entorno críticas. El hilo se detendrá.")
         return
 
+    # --- Se inicializan los clientes de Jira y Grafana ---
     try:
+        # El header de autorización para Grafana Cloud es 'Bearer USER:KEY'
+        auth_header = {"Authorization": f"Bearer {GRAFANA_INSTANCE_ID}:{GRAFANA_API_KEY}"}
+        grafana_client = PrometheusConnect(url=GRAFANA_PUSH_URL, headers=auth_header)
+        
         jira_client = JIRA(server=JIRA_SERVER, basic_auth=(JIRA_USER, JIRA_API_TOKEN))
-        logging.info("Conexión con Jira establecida en hilo de fondo.")
+        logging.info("Conexiones con Jira y Grafana Cloud establecidas en hilo de fondo.")
     except Exception as e:
-        logging.critical(f"No se pudo conectar a Jira en hilo de fondo: {e}. El hilo se detendrá.")
+        logging.critical(f"No se pudo conectar a los servicios: {e}. El hilo se detendrá.")
         return
 
     while True:
@@ -122,7 +90,7 @@ def metrics_and_alerts_loop():
         }
         
         try:
-            # Lógica de recolección de métricas
+            # Lógica de recolección de métricas (sin cambios)
             jql_paused = f'project = {PROJECT_KEY} AND status = "EN PAUSA"'
             paused_tickets = jira_client.search_issues(jql_paused, maxResults=100)
             METRICS['paused_overdue'].set(sum(1 for t in paused_tickets if count_business_days(t.fields.updated) > 5))
@@ -152,6 +120,7 @@ def metrics_and_alerts_loop():
             logging.info("Recolección de métricas completada.")
             
             # --- LÓGICA DE ALERTAS COMPLETA ---
+            # Alerta de Nuevos Tickets Críticos
             jql_new_critical = f'project = {PROJECT_KEY} AND priority in (Highest, High) AND created >= "-5m"'
             new_critical_tickets = jira_client.search_issues(jql_new_critical)
             for ticket in new_critical_tickets:
@@ -162,6 +131,7 @@ def metrics_and_alerts_loop():
                                   f"*Componente:* {component}")
                  send_alert(alert_message)
 
+            # Alerta de Nuevos Comentarios de Externos
             jql_critical_updated = f'project = {PROJECT_KEY} AND priority in (Highest, High) AND updated >= "-5m"'
             critical_updated_tickets = jira_client.search_issues(jql_critical_updated)
             for ticket in critical_updated_tickets:
@@ -176,8 +146,9 @@ def metrics_and_alerts_loop():
                         send_alert(alert_message)
                         ALERTED_TICKETS["new_comment"][ticket.key] = last_comment.id
 
-            # --- Lógica de envío final ---
-            send_to_grafana_remote_write(registry)
+            # --- Lógica de envío final y simplificada ---
+            logging.info("Enviando métricas a Grafana Cloud con prometheus-api-client...")
+            grafana_client.push_metrics(registry=registry, job_name='jira_exporter_render')
             logging.info("Métricas enviadas con éxito.")
 
         except Exception as e:
