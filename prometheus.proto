@@ -14,12 +14,6 @@
 syntax = "proto3";
 package prompb;
 
-import "gogoproto/gogo.proto";
-
-option (gogoproto.marshaler_all) = true;
-option (gogoproto.unmarshaler_all) = true;
-option (gogoproto.sizer_all) = true;
-
 message Sample {
   double value    = 1;
   int64  timestamp = 2;
@@ -27,8 +21,8 @@ message Sample {
 
 // TimeSeries represents a single time series.
 message TimeSeries {
-  repeated Label  labels  = 1 [(gogoproto.nullable) = false];
-  repeated Sample samples = 2 [(gogoproto.nullable) = false];
+  repeated Label  labels  = 1;
+  repeated Sample samples = 2;
 }
 
 message Label {
@@ -37,7 +31,7 @@ message Label {
 }
 
 message Labels {
-  repeated Label labels = 1 [(gogoproto.nullable) = false];
+  repeated Label labels = 1;
 }
 
 // Matcher specifies a rule, which can match or not match a time series.
@@ -65,7 +59,7 @@ message ReadHints {
 
 // WriteRequest represents a remote write request.
 message WriteRequest {
-  repeated TimeSeries timeseries = 1 [(gogoproto.nullable) = false];
+  repeated TimeSeries timeseries = 1;
 }
 
 // ReadRequest represents a remote read request.
