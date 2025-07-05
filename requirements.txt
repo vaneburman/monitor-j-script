@@ -4,5 +4,6 @@ python-dotenv
 requests
 Flask
 python-snappy
-protobuf==4.25.3
+protobuf==3.20.3
 grpcio-tools
+gogo-gen
