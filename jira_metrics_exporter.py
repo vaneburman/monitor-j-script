@@ -8,6 +8,7 @@ import os
 import time
 import logging
 import threading # Para ejecutar tareas en segundo plano
+import functools # <--- NUEVO: Necesario para la autenticación corregida
 from datetime import datetime, date, timedelta
 import requests
 from jira import JIRA
@@ -69,7 +70,6 @@ def metrics_and_alerts_loop():
     """Bucle infinito que se ejecuta en segundo plano para recolectar y enviar métricas."""
     logging.info("Iniciando hilo de recolección de métricas...")
     
-    # Valida que las variables de entorno críticas estén configuradas
     if not all([JIRA_SERVER, JIRA_USER, JIRA_API_TOKEN, GRAFANA_CLOUD_URL, GRAFANA_CLOUD_INSTANCE_ID, GRAFANA_CLOUD_API_KEY]):
         logging.critical("Error en hilo de fondo: Faltan variables de entorno críticas. El hilo se detendrá.")
         return
@@ -93,7 +93,6 @@ def metrics_and_alerts_loop():
         }
         
         try:
-            # Tu lógica de recolección de métricas (sin cambios)
             jql_paused = f'project = {PROJECT_KEY} AND status = "EN PAUSA"'
             paused_tickets = jira_client.search_issues(jql_paused, maxResults=100)
             METRICS['paused_overdue'].set(sum(1 for t in paused_tickets if count_business_days(t.fields.updated) > 5))
@@ -123,7 +122,6 @@ def metrics_and_alerts_loop():
 
             logging.info("Recolección de métricas completada.")
 
-            # Lógica de Alertas en tiempo real
             jql_new_critical = f'project = {PROJECT_KEY} AND priority in (Highest, High) AND created >= "-5m"'
             new_critical_tickets = jira_client.search_issues(jql_new_critical)
             for ticket in new_critical_tickets:
@@ -148,13 +146,21 @@ def metrics_and_alerts_loop():
                         send_alert(alert_message)
                         ALERTED_TICKETS["new_comment"][ticket.key] = last_comment.id
 
-            # Lógica de envío a Grafana
+            # --- CORREGIDO: Lógica de envío a Grafana ---
             logging.info("Enviando métricas a Grafana Cloud...")
+            
+            # Se crea un manejador de autenticación con las credenciales pre-cargadas.
+            auth_handler = functools.partial(
+                basic_auth_handler,
+                username=GRAFANA_CLOUD_INSTANCE_ID,
+                password=GRAFANA_CLOUD_API_KEY
+            )
+
             push_to_gateway(
                 gateway=f"{GRAFANA_CLOUD_URL}/gateway",
                 job='jira_exporter_render',
                 registry=registry,
-                handler=basic_auth_handler(username=GRAFANA_CLOUD_INSTANCE_ID, password=GRAFANA_CLOUD_API_KEY)
+                handler=auth_handler # Se usa el nuevo manejador
             )
             logging.info("Métricas enviadas con éxito.")
 
@@ -174,13 +180,9 @@ def hello_world():
 
 # --- Bucle Principal ---
 if __name__ == '__main__':
-    # 1. Inicia el bucle de métricas en un hilo de fondo.
-    #    El 'daemon=True' asegura que el hilo se cierre si el programa principal termina.
     metrics_thread = threading.Thread(target=metrics_and_alerts_loop, daemon=True)
     metrics_thread.start()
 
-    # 2. Inicia el servidor web Flask en el hilo principal.
-    #    Render automáticamente provee la variable de entorno PORT.
     port = int(os.environ.get('PORT', 10000))
     logging.info(f"Iniciando servidor web en el puerto {port} para los health checks de Render...")
     app.run(host='0.0.0.0', port=port)
