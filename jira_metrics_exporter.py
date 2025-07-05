@@ -1,21 +1,19 @@
 # jira_metrics_exporter.py
 #
-# Script HÍBRIDO:
-# 1. En un hilo de fondo: Obtiene métricas de Jira y las envía (push) a Grafana Cloud.
-# 2. En el hilo principal: Inicia un servidor web Flask para satisfacer los health checks de Render.
+# Versión Final y Robusta
 #
 import os
 import time
 import logging
-import threading # Para ejecutar tareas en segundo plano
-import functools # <--- NUEVO: Necesario para la autenticación corregida
+import threading
+import functools
 from datetime import datetime, date, timedelta
 import requests
 from jira import JIRA
 from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
 from prometheus_client.exposition import basic_auth_handler
 from dotenv import load_dotenv
-from flask import Flask # El mini servidor web
+from flask import Flask
 
 # --- Configuración Inicial ---
 load_dotenv() 
@@ -27,9 +25,11 @@ JIRA_USER = os.getenv("JIRA_USER")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 PROJECT_KEY = "GRV"
 GMAIL_CHAT_WEBHOOK = os.getenv("GMAIL_CHAT_WEBHOOK")
-GRAFANA_CLOUD_URL = os.getenv('GRAFANA_CLOUD_URL')
-GRAFANA_CLOUD_INSTANCE_ID = os.getenv('GRAFANA_CLOUD_INSTANCE_ID')
-GRAFANA_CLOUD_API_KEY = os.getenv('GRAFANA_CLOUD_API_KEY')
+
+# --- MODIFICADO: Se usa una única y explícita URL para el push ---
+GRAFANA_PUSH_URL = os.getenv('GRAFANA_PUSH_URL') 
+GRAFANA_INSTANCE_ID = os.getenv('GRAFANA_CLOUD_INSTANCE_ID')
+GRAFANA_API_KEY = os.getenv('GRAFANA_CLOUD_API_KEY')
 
 # --- Lista de Usuarios Internos ---
 DEFAULT_INTERNAL_USERS = [
@@ -40,12 +40,10 @@ INTERNAL_USERS_STR = os.getenv("INTERNAL_USERS")
 INTERNAL_USERS = [name.strip() for name in INTERNAL_USERS_STR.split(',')] if INTERNAL_USERS_STR else DEFAULT_INTERNAL_USERS
 logging.info(f"Usuarios internos configurados: {INTERNAL_USERS}")
 
-# --- Estado para evitar alertas duplicadas ---
 ALERTED_TICKETS = {"new_comment": {}}
 
 # --- Funciones Auxiliares (sin cambios) ---
 def count_business_days(start_date_str):
-    """Calcula el número de días hábiles (L-V) desde una fecha dada."""
     try:
         start_date = datetime.strptime(start_date_str, '%Y-%m-%dT%H:%M:%S.%f%z').date()
     except ValueError:
@@ -54,23 +52,18 @@ def count_business_days(start_date_str):
     return len([d for d in (start_date + timedelta(days=i) for i in range((today - start_date).days)) if d.weekday() < 5])
 
 def send_alert(message):
-    """Envía una alerta al webhook del Chat de Gmail."""
-    if not GMAIL_CHAT_WEBHOOK:
-        logging.warning("No se ha configurado GMAIL_CHAT_WEBHOOK. No se enviará la alerta.")
-        return
+    if not GMAIL_CHAT_WEBHOOK: return
     try:
-        response = requests.post(GMAIL_CHAT_WEBHOOK, json={'text': message})
-        response.raise_for_status()
+        requests.post(GMAIL_CHAT_WEBHOOK, json={'text': message}, timeout=10).raise_for_status()
         logging.info("Alerta enviada correctamente.")
     except requests.exceptions.RequestException as e:
         logging.error(f"Error al enviar la alerta: {e}")
 
-# --- Lógica de Métricas (ahora dentro de una función para el hilo de fondo) ---
+# --- Lógica de Métricas ---
 def metrics_and_alerts_loop():
-    """Bucle infinito que se ejecuta en segundo plano para recolectar y enviar métricas."""
     logging.info("Iniciando hilo de recolección de métricas...")
     
-    if not all([JIRA_SERVER, JIRA_USER, JIRA_API_TOKEN, GRAFANA_CLOUD_URL, GRAFANA_CLOUD_INSTANCE_ID, GRAFANA_CLOUD_API_KEY]):
+    if not all([JIRA_SERVER, JIRA_USER, JIRA_API_TOKEN, GRAFANA_PUSH_URL, GRAFANA_INSTANCE_ID, GRAFANA_API_KEY]):
         logging.critical("Error en hilo de fondo: Faltan variables de entorno críticas. El hilo se detendrá.")
         return
 
@@ -93,6 +86,7 @@ def metrics_and_alerts_loop():
         }
         
         try:
+            # Lógica de recolección de métricas
             jql_paused = f'project = {PROJECT_KEY} AND status = "EN PAUSA"'
             paused_tickets = jira_client.search_issues(jql_paused, maxResults=100)
             METRICS['paused_overdue'].set(sum(1 for t in paused_tickets if count_business_days(t.fields.updated) > 5))
@@ -109,8 +103,7 @@ def metrics_and_alerts_loop():
                                 assignee = getattr(ticket.fields.assignee, 'displayName', 'No Asignado')
                                 METRICS['inprogress_overdue'].labels(assignee=assignee).inc()
                             break
-                    else:
-                        continue
+                    else: continue
                     break
 
             jql_arq = f'project = {PROJECT_KEY} AND status = "In Progress C"'
@@ -121,7 +114,8 @@ def metrics_and_alerts_loop():
             METRICS['uat'].set(jira_client.search_issues(f'project = {PROJECT_KEY} AND status = "UAT"', maxResults=0).total)
 
             logging.info("Recolección de métricas completada.")
-
+            
+            # Lógica de Alertas en tiempo real (COMPLETA)
             jql_new_critical = f'project = {PROJECT_KEY} AND priority in (Highest, High) AND created >= "-5m"'
             new_critical_tickets = jira_client.search_issues(jql_new_critical)
             for ticket in new_critical_tickets:
@@ -146,21 +140,16 @@ def metrics_and_alerts_loop():
                         send_alert(alert_message)
                         ALERTED_TICKETS["new_comment"][ticket.key] = last_comment.id
 
-            # --- CORREGIDO: Lógica de envío a Grafana ---
-            logging.info("Enviando métricas a Grafana Cloud...")
+            # Lógica de envío a Grafana
+            auth_handler = functools.partial(basic_auth_handler, username=GRAFANA_INSTANCE_ID, password=GRAFANA_API_KEY)
             
-            # Se crea un manejador de autenticación con las credenciales pre-cargadas.
-            auth_handler = functools.partial(
-                basic_auth_handler,
-                username=GRAFANA_CLOUD_INSTANCE_ID,
-                password=GRAFANA_CLOUD_API_KEY
-            )
+            logging.info(f"Intentando enviar métricas a: {GRAFANA_PUSH_URL}")
 
             push_to_gateway(
-                gateway=f"{GRAFANA_CLOUD_URL}/push",
+                gateway=GRAFANA_PUSH_URL, # Se usa la variable explícita
                 job='jira_exporter_render',
                 registry=registry,
-                handler=auth_handler # Se usa el nuevo manejador
+                handler=auth_handler
             )
             logging.info("Métricas enviadas con éxito.")
 
@@ -172,17 +161,14 @@ def metrics_and_alerts_loop():
 
 # --- Configuración del Servidor Web Flask ---
 app = Flask(__name__)
-
 @app.route('/')
 def hello_world():
-    """Esta es la ruta que Render usará para su health check."""
     return 'El worker de métricas de Jira está corriendo en segundo plano. ¡Todo OK!'
 
 # --- Bucle Principal ---
 if __name__ == '__main__':
     metrics_thread = threading.Thread(target=metrics_and_alerts_loop, daemon=True)
     metrics_thread.start()
-
     port = int(os.environ.get('PORT', 10000))
     logging.info(f"Iniciando servidor web en el puerto {port} para los health checks de Render...")
     app.run(host='0.0.0.0', port=port)
