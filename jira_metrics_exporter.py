@@ -1,6 +1,6 @@
 # jira_metrics_exporter.py
 #
-# Versión Final, Completa y Robusta con Envío Manual y Alertas
+# Versión Final, Completa y Robusta con Envío en Formato Correcto y Alertas
 #
 import os
 import time
@@ -9,23 +9,28 @@ import threading
 from datetime import datetime, date, timedelta
 import requests
 from jira import JIRA
-# Se importa generate_latest para crear el payload, ya no se usa push_to_gateway
-from prometheus_client import CollectorRegistry, Gauge, generate_latest
+# Se importa lo necesario para construir el payload para el Remote Write Endpoint
+from prometheus_client import CollectorRegistry, Gauge
 from dotenv import load_dotenv
 from flask import Flask
+
+# --- Librerías para el formato Remote Write ---
+import snappy
+# Es posible que necesites generar el archivo prometheus_pb2.py a partir de prometheus.proto
+# si no lo tienes. Se puede encontrar en el repositorio de Prometheus.
+# Por simplicidad, asumimos que está disponible.
+from prometheus_pb2 import WriteRequest, TimeSeries, Label, Sample
 
 # --- Configuración Inicial ---
 load_dotenv() 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Variables de Configuración (leídas desde el entorno) ---
+# --- Variables de Configuración ---
 JIRA_SERVER = os.getenv("JIRA_SERVER")
 JIRA_USER = os.getenv("JIRA_USER")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 PROJECT_KEY = "GRV"
 GMAIL_CHAT_WEBHOOK = os.getenv("GMAIL_CHAT_WEBHOOK")
-
-# Se usa una única y explícita URL para el push
 GRAFANA_PUSH_URL = os.getenv('GRAFANA_PUSH_URL') 
 GRAFANA_INSTANCE_ID = os.getenv('GRAFANA_CLOUD_INSTANCE_ID')
 GRAFANA_API_KEY = os.getenv('GRAFANA_CLOUD_API_KEY')
@@ -41,9 +46,8 @@ logging.info(f"Usuarios internos configurados: {INTERNAL_USERS}")
 
 ALERTED_TICKETS = {"new_comment": {}}
 
-# --- Funciones Auxiliares (sin cambios) ---
+# --- Funciones Auxiliares ---
 def count_business_days(start_date_str):
-    """Calcula el número de días hábiles (L-V) desde una fecha dada."""
     try:
         start_date = datetime.strptime(start_date_str, '%Y-%m-%dT%H:%M:%S.%f%z').date()
     except ValueError:
@@ -52,19 +56,50 @@ def count_business_days(start_date_str):
     return len([d for d in (start_date + timedelta(days=i) for i in range((today - start_date).days)) if d.weekday() < 5])
 
 def send_alert(message):
-    """Envía una alerta al webhook del Chat de Gmail."""
-    if not GMAIL_CHAT_WEBHOOK:
-        logging.warning("No se ha configurado GMAIL_CHAT_WEBHOOK. No se enviará la alerta.")
-        return
+    if not GMAIL_CHAT_WEBHOOK: return
     try:
         requests.post(GMAIL_CHAT_WEBHOOK, json={'text': message}, timeout=10).raise_for_status()
         logging.info("Alerta enviada correctamente.")
     except requests.exceptions.RequestException as e:
         logging.error(f"Error al enviar la alerta: {e}")
+        
+# --- Nueva Función de Envío Correcta ---
+def send_to_grafana_remote_write(registry):
+    """Convierte métricas al formato Protobuf, las comprime con Snappy y las envía."""
+    metric_families = registry.collect()
+    write_request = WriteRequest()
+    
+    for family in metric_families:
+        for s in family.samples:
+            time_series = TimeSeries()
+            time_series.labels.append(Label(name="__name__", value=s.name))
+            for label_name, label_value in s.labels.items():
+                time_series.labels.append(Label(name=label_name, value=label_value))
+            timestamp_ms = int(time.time() * 1000)
+            time_series.samples.append(Sample(value=s.value, timestamp=timestamp_ms))
+            write_request.timeseries.append(time_series)
 
-# --- Lógica de Métricas ---
+    uncompressed_data = write_request.SerializeToString()
+    compressed_data = snappy.compress(uncompressed_data)
+
+    headers = {
+        'Content-Type': 'application/x-protobuf',
+        'Content-Encoding': 'snappy',
+        'X-Prometheus-Remote-Write-Version': '0.1.0'
+    }
+    
+    logging.info(f"Enviando {len(compressed_data)} bytes de datos comprimidos a: {GRAFANA_PUSH_URL}")
+    response = requests.post(
+        url=GRAFANA_PUSH_URL,
+        auth=(GRAFANA_INSTANCE_ID, GRAFANA_API_KEY),
+        data=compressed_data,
+        headers=headers
+    )
+    response.raise_for_status()
+
+
+# --- Lógica Principal de Métricas y Alertas ---
 def metrics_and_alerts_loop():
-    """Bucle infinito que se ejecuta en segundo plano para recolectar y enviar métricas."""
     logging.info("Iniciando hilo de recolección de métricas...")
     
     if not all([JIRA_SERVER, JIRA_USER, JIRA_API_TOKEN, GRAFANA_PUSH_URL, GRAFANA_INSTANCE_ID, GRAFANA_API_KEY]):
@@ -119,8 +154,7 @@ def metrics_and_alerts_loop():
 
             logging.info("Recolección de métricas completada.")
             
-            # --- LÓGICA DE ALERTAS COMPLETA RESTAURADA ---
-            # Alerta de Nuevos Tickets Críticos
+            # --- LÓGICA DE ALERTAS COMPLETA ---
             jql_new_critical = f'project = {PROJECT_KEY} AND priority in (Highest, High) AND created >= "-5m"'
             new_critical_tickets = jira_client.search_issues(jql_new_critical)
             for ticket in new_critical_tickets:
@@ -131,7 +165,6 @@ def metrics_and_alerts_loop():
                                   f"*Componente:* {component}")
                  send_alert(alert_message)
 
-            # Alerta de Nuevos Comentarios de Externos
             jql_critical_updated = f'project = {PROJECT_KEY} AND priority in (Highest, High) AND updated >= "-5m"'
             critical_updated_tickets = jira_client.search_issues(jql_critical_updated)
             for ticket in critical_updated_tickets:
@@ -146,23 +179,8 @@ def metrics_and_alerts_loop():
                         send_alert(alert_message)
                         ALERTED_TICKETS["new_comment"][ticket.key] = last_comment.id
 
-            # --- Lógica de envío manual con requests ---
-            logging.info(f"Preparando envío manual a: {GRAFANA_PUSH_URL}")
-            
-            # 1. Genera los datos de las métricas en el formato de texto de Prometheus
-            metrics_data = generate_latest(registry)
-            
-            # 2. Envía los datos usando requests.post
-            response = requests.post(
-                url=GRAFANA_PUSH_URL,
-                auth=(GRAFANA_INSTANCE_ID, GRAFANA_API_KEY),
-                data=metrics_data,
-                headers={'Content-Type': 'text/plain; version=0.0.4'} # Header más específico
-            )
-            
-            # 3. Verifica la respuesta del servidor de Grafana
-            response.raise_for_status() # Esto dará un error si el código no es 2xx
-            
+            # --- Lógica de envío final ---
+            send_to_grafana_remote_write(registry)
             logging.info("Métricas enviadas con éxito.")
 
         except Exception as e:
