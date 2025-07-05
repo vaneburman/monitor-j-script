@@ -3,4 +3,5 @@ prometheus-client
 python-dotenv
 requests
 Flask
-prometheus-api-client
+python-snappy
+grpcio-tools
