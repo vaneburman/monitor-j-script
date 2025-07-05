@@ -18,6 +18,8 @@ from flask import Flask
 import snappy
 # Este import ahora funcionará porque build.sh crea el archivo
 from prometheus_pb2 import WriteRequest, TimeSeries, Label, Sample
+# Este import es requerido por el .proto completo
+import gogo_pb2
 
 # --- Configuración Inicial ---
 load_dotenv() 
