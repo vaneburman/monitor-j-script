@@ -1,7 +1,6 @@
-# jira_metrics_exporter.py
 #
-# Versión Final y Autónoma.
-# El script lee una lista de NOMBRES de desarrolladores y busca sus Account IDs
+# Versión Final y Autónoma - CORREGIDA
+# El script lee listas de NOMBRES de desarrolladores, QA y PM, y busca sus Account IDs
 # automáticamente al iniciar, para luego usarlos en las consultas.
 #
 import os
@@ -34,10 +33,15 @@ GRAFANA_INSTANCE_ID = os.getenv('GRAFANA_CLOUD_INSTANCE_ID')
 GRAFANA_API_KEY = os.getenv('GRAFANA_CLOUD_API_KEY')
 
 # --- Listas de Equipo ---
-# ¡MODIFICADO! Leemos la lista de nombres de desarrolladores desde una variable de entorno.
+# Leemos las listas de nombres desde variables de entorno
 DEVELOPER_NAMES_STR = os.getenv("DEVELOPER_LIST")
-QA_TEAM = ["Agustin Godoy"]
-DEVELOPER_MAP = {} # Este mapa se llenará automáticamente
+QA_NAMES_STR = os.getenv("QA_LIST")
+PM_NAMES_STR = os.getenv("PM_LIST")
+
+# Mapas que se llenarán automáticamente con Account IDs
+DEVELOPER_MAP = {}
+QA_MAP = {}
+PM_MAP = {}
 
 ALERTED_TICKETS = {"new_comment": {}}
 
@@ -60,6 +64,27 @@ def send_alert(message):
     except requests.exceptions.RequestException as e:
         logging.error(f"Error al enviar la alerta: {e}")
 
+def build_user_map(jira_client, names_str, map_name):
+    """Construye un mapa de Account ID -> Display Name para una lista de nombres."""
+    user_map = {}
+    if names_str:
+        names = [name.strip() for name in names_str.split(',')]
+        logging.info(f"Buscando Account IDs para {map_name}: {names}")
+        for name in names:
+            try:
+                users = jira_client.search_users(query=name, maxResults=1)
+                if users:
+                    user = users[0]
+                    user_map[user.accountId] = user.displayName
+                    logging.info(f"  -> Encontrado: '{user.displayName}' -> {user.accountId}")
+                else:
+                    logging.warning(f"  -> No se encontró ningún usuario para el nombre: '{name}'")
+            except Exception as e:
+                logging.error(f"Error buscando al usuario '{name}': {e}")
+    else:
+        logging.warning(f"La variable de entorno para {map_name} está vacía.")
+    return user_map
+
 # --- Función de Envío ---
 def send_to_grafana_remote_write(registry):
     metric_families = registry.collect()
@@ -76,12 +101,14 @@ def send_to_grafana_remote_write(registry):
     response.raise_for_status()
 
 # --- Lógica Principal de Métricas y Alertas ---
-def metrics_and_alerts_loop(jira_client, developer_map):
-    """Bucle principal que se ejecuta con el cliente de Jira y el mapa de desarrolladores ya inicializados."""
+def metrics_and_alerts_loop(jira_client, developer_map, qa_map, pm_map):
+    """Bucle principal que se ejecuta con el cliente de Jira y los mapas de usuarios ya inicializados."""
     
-    # Construye la lista de usuarios internos una sola vez
-    internal_users = list(developer_map.values()) + QA_TEAM + ["Marcelo Santini"]
-    logging.info(f"Usuarios internos (no generan alertas): {internal_users}")
+    # Construye la lista de usuarios internos (Account IDs) una sola vez
+    internal_user_ids = list(developer_map.keys()) + list(qa_map.keys()) + list(pm_map.keys())
+    internal_user_names = list(developer_map.values()) + list(qa_map.values()) + list(pm_map.values())
+    logging.info(f"Usuarios internos (Account IDs): {internal_user_ids}")
+    logging.info(f"Nombres de usuarios internos: {internal_user_names}")
 
     while True:
         logging.info("Iniciando ciclo de recolección de desempeño...")
@@ -113,18 +140,22 @@ def metrics_and_alerts_loop(jira_client, developer_map):
                         dev_cycle_time.labels(developer=dev_name).observe(business_hours_between(in_progress_time, ready_for_prod_time))
                     if rework_events > 0: dev_rework_count.labels(developer=dev_name).inc(rework_events)
 
-            # --- Lógica para QA ---
-            jql_qa_done = f'project = {PROJECT_KEY} AND status changed from "Test" by ("Agustin Godoy") after -7d'
-            qa_done_issues = jira_client.search_issues(jql_qa_done, expand="changelog", maxResults=100)
-            for issue in qa_done_issues:
-                test_start_time, test_end_time = None, None
-                for history in reversed(issue.changelog.histories):
-                    for item in history.items:
-                        if item.field == 'status':
-                            if item.toString == 'Test' and not test_start_time: test_start_time = parse_jira_date(history.created)
-                            if item.fromString == 'Test' and test_start_time and not test_end_time: test_end_time = parse_jira_date(history.created)
-                if test_start_time and test_end_time:
-                    qa_cycle_time.observe(business_hours_between(test_start_time, test_end_time) / 8)
+            # --- Lógica para QA usando Account IDs ---
+            if qa_map:
+                # Construir la consulta JQL con todos los QA Account IDs
+                qa_account_ids = ', '.join(f'"{acc_id}"' for acc_id in qa_map.keys())
+                jql_qa_done = f'project = {PROJECT_KEY} AND status changed from "Test" by ({qa_account_ids}) after -7d'
+                qa_done_issues = jira_client.search_issues(jql_qa_done, expand="changelog", maxResults=100)
+                
+                for issue in qa_done_issues:
+                    test_start_time, test_end_time = None, None
+                    for history in reversed(issue.changelog.histories):
+                        for item in history.items:
+                            if item.field == 'status':
+                                if item.toString == 'Test' and not test_start_time: test_start_time = parse_jira_date(history.created)
+                                if item.fromString == 'Test' and test_start_time and not test_end_time: test_end_time = parse_jira_date(history.created)
+                    if test_start_time and test_end_time:
+                        qa_cycle_time.observe(business_hours_between(test_start_time, test_end_time) / 8)
 
             logging.info("Recolección de métricas de desempeño completada.")
             
@@ -146,11 +177,11 @@ def metrics_and_alerts_loop(jira_client, developer_map):
                 comments = jira_client.comments(ticket)
                 if comments:
                     last_comment = comments[-1]
-                    author_display_name = last_comment.author.displayName
-                    if author_display_name not in internal_users and ALERTED_TICKETS["new_comment"].get(ticket.key) != last_comment.id:
+                    # Verificar si el autor del comentario es usuario interno (por Account ID)
+                    if last_comment.author.accountId not in internal_user_ids and ALERTED_TICKETS["new_comment"].get(ticket.key) != last_comment.id:
                         alert_message = (f"⚠️ *Nuevo Comentario importante en Ticket Crítico*\n\n"
                                          f"<{JIRA_SERVER}/browse/{ticket.key}|{ticket.key}> - *{ticket.fields.summary}*\n"
-                                         f"*Autor del Comentario:* {author_display_name}")
+                                         f"*Autor del Comentario:* {last_comment.author.displayName}")
                         send_alert(alert_message)
                         ALERTED_TICKETS["new_comment"][ticket.key] = last_comment.id
             logging.info("Búsqueda de alertas finalizada.")
@@ -181,32 +212,20 @@ if __name__ == '__main__':
         logging.critical(f"No se pudo establecer la conexión inicial con Jira: {e}")
         exit(1)
 
-    # 2. Construir el mapa de desarrolladores automáticamente
-    developer_map = {}
-    if DEVELOPER_NAMES_STR:
-        developer_names = [name.strip() for name in DEVELOPER_NAMES_STR.split(',')]
-        logging.info(f"Buscando Account IDs para: {developer_names}")
-        for name in developer_names:
-            try:
-                # La función search_users es la forma correcta de encontrar usuarios
-                users = jira_client.search_users(query=name, maxResults=1)
-                if users:
-                    user = users[0]
-                    developer_map[user.accountId] = user.displayName
-                    logging.info(f"  -> Encontrado: '{user.displayName}' -> {user.accountId}")
-                else:
-                    logging.warning(f"  -> No se encontró ningún usuario para el nombre: '{name}'")
-            except Exception as e:
-                logging.error(f"Error buscando al usuario '{name}': {e}")
-    else:
-        logging.warning("La variable de entorno DEVELOPER_LIST está vacía. No se medirán métricas de desarrollador.")
+    # 2. Construir los mapas de usuarios automáticamente
+    DEVELOPER_MAP = build_user_map(jira_client, DEVELOPER_NAMES_STR, "DEVELOPERS")
+    QA_MAP = build_user_map(jira_client, QA_NAMES_STR, "QA")
+    PM_MAP = build_user_map(jira_client, PM_NAMES_STR, "PM")
 
-    # 3. Iniciar el hilo de fondo con los datos ya listos
-    metrics_thread = threading.Thread(target=metrics_and_alerts_loop, args=(jira_client, developer_map), daemon=True)
+    # 3. Verificar que se encontraron usuarios
+    if not DEVELOPER_MAP and not QA_MAP and not PM_MAP:
+        logging.warning("No se encontraron usuarios en ninguna categoría. Verificar variables de entorno.")
+    
+    # 4. Iniciar el hilo de fondo con los datos ya listos
+    metrics_thread = threading.Thread(target=metrics_and_alerts_loop, args=(jira_client, DEVELOPER_MAP, QA_MAP, PM_MAP), daemon=True)
     metrics_thread.start()
 
-    # 4. Iniciar el servidor web
+    # 5. Iniciar el servidor web
     port = int(os.environ.get('PORT', 10000))
     logging.info(f"Iniciando servidor web en el puerto {port}...")
     app.run(host='0.0.0.0', port=port)
-
