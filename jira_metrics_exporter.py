@@ -157,7 +157,7 @@ def metrics_and_alerts_loop():
             )
 
             push_to_gateway(
-                gateway=f"{GRAFANA_CLOUD_URL}/gateway",
+                gateway=f"{GRAFANA_CLOUD_URL}/push",
                 job='jira_exporter_render',
                 registry=registry,
                 handler=auth_handler # Se usa el nuevo manejador
