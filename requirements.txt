@@ -1,0 +1,4 @@
+jira
+prometheus-client
+python-dotenv
+request
