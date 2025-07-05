@@ -9,16 +9,13 @@ import threading
 from datetime import datetime, date, timedelta
 import requests
 from jira import JIRA
-# Se importa lo necesario para construir el payload para el Remote Write Endpoint
 from prometheus_client import CollectorRegistry, Gauge
 from dotenv import load_dotenv
 from flask import Flask
 
 # --- Librerías para el formato Remote Write ---
 import snappy
-# Es posible que necesites generar el archivo prometheus_pb2.py a partir de prometheus.proto
-# si no lo tienes. Se puede encontrar en el repositorio de Prometheus.
-# Por simplicidad, asumimos que está disponible.
+# Importa las clases desde el archivo prometheus_pb2.py que creamos en el proyecto
 from prometheus_pb2 import WriteRequest, TimeSeries, Label, Sample
 
 # --- Configuración Inicial ---
