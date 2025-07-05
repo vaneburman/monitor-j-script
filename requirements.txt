@@ -2,3 +2,4 @@ jira
 prometheus-client
 python-dotenv
 requests
+Flask
