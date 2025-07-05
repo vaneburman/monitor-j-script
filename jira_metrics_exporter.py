@@ -130,7 +130,7 @@ def process_metrics(jira):
 
         # --- Lógica de Alertas en tiempo real ---
         # Alerta de Nuevos Tickets Críticos
-        jql_new_critical = f'project = {PROJECT_KEY} AND priority in (Blocker, High) AND created >= "-5m"'
+        jql_new_critical = f'project = {PROJECT_KEY} AND priority in ("Bloqueante", "Alta") AND created >= "-5m"'
         new_critical_tickets = jira.search_issues(jql_new_critical)
         for ticket in new_critical_tickets:
              component = ticket.fields.components[0].name if ticket.fields.components else "N/A"
@@ -141,7 +141,7 @@ def process_metrics(jira):
              send_alert(alert_message)
 
         # Alerta de Nuevos Comentarios de Externos
-        jql_critical_updated = f'project = {PROJECT_KEY} AND priority in (Bloqueante, Alta) AND updated >= "-5m"'
+        jql_critical_updated = f'project = {PROJECT_KEY} AND priority in ("Bloqueante", "Alta") AND updated >= "-5m"'
         critical_updated_tickets = jira.search_issues(jql_critical_updated)
         for ticket in critical_updated_tickets:
             comments = jira.comments(ticket)
