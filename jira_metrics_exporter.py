@@ -122,10 +122,10 @@ def metrics_and_alerts_loop(jira_client, developer_map, qa_map, pm_map):
         try:
             # --- Lógica para Desarrolladores usando el mapa de Account IDs ---
             for acc_id, dev_name in developer_map.items():
-                jql_current = f'project = {PROJECT_KEY} AND status = "EN CURSO" AND assignee = "{acc_id}"'
+                jql_current = f'project = {PROJECT_KEY} AND status = "In Progress" AND assignee = "{acc_id}"'
                 dev_tickets_in_progress.labels(developer=dev_name).set(jira_client.search_issues(jql_current, maxResults=0).total)
 
-                jql_closed = f'project = {PROJECT_KEY} AND status changed to "Listo para Prod" AND assignee = "{acc_id}" AND updated >= -7d'
+                jql_closed = f'project = {PROJECT_KEY} AND status changed to "IN PROGRESS D" AND assignee = "{acc_id}" AND updated >= -7d'
                 closed_issues = jira_client.search_issues(jql_closed, expand="changelog", maxResults=100)
 
                 for issue in closed_issues:
@@ -133,9 +133,9 @@ def metrics_and_alerts_loop(jira_client, developer_map, qa_map, pm_map):
                     for history in issue.changelog.histories:
                         for item in history.items:
                             if item.field == 'status':
-                                if item.toString == 'EN CURSO': in_progress_time = parse_jira_date(history.created)
-                                if item.toString == 'Listo para Prod' and not ready_for_prod_time: ready_for_prod_time = parse_jira_date(history.created)
-                                if item.fromString in ['Test', 'In Progress C'] and item.toString == 'EN CURSO': rework_events += 1
+                                if item.toString == 'In Progress': in_progress_time = parse_jira_date(history.created)
+                                if item.toString == 'IN PROGRESS D' and not ready_for_prod_time: ready_for_prod_time = parse_jira_date(history.created)
+                                if item.fromString in ['Test', 'In Progress C'] and item.toString == 'In Progress': rework_events += 1
                     if in_progress_time and ready_for_prod_time:
                         dev_cycle_time.labels(developer=dev_name).observe(business_hours_between(in_progress_time, ready_for_prod_time))
                     if rework_events > 0: dev_rework_count.labels(developer=dev_name).inc(rework_events)
@@ -144,7 +144,7 @@ def metrics_and_alerts_loop(jira_client, developer_map, qa_map, pm_map):
             if qa_map:
                 # Construir la consulta JQL con todos los QA Account IDs
                 qa_account_ids = ', '.join(f'"{acc_id}"' for acc_id in qa_map.keys())
-                jql_qa_done = f'project = {PROJECT_KEY} AND status changed from "Test" by ({qa_account_ids}) after -7d'
+                jql_qa_done = f'project = {PROJECT_KEY} AND status changed from "TEST" by ({qa_account_ids}) after -7d'
                 qa_done_issues = jira_client.search_issues(jql_qa_done, expand="changelog", maxResults=100)
                 
                 for issue in qa_done_issues:
@@ -152,8 +152,8 @@ def metrics_and_alerts_loop(jira_client, developer_map, qa_map, pm_map):
                     for history in reversed(issue.changelog.histories):
                         for item in history.items:
                             if item.field == 'status':
-                                if item.toString == 'Test' and not test_start_time: test_start_time = parse_jira_date(history.created)
-                                if item.fromString == 'Test' and test_start_time and not test_end_time: test_end_time = parse_jira_date(history.created)
+                                if item.toString == 'TEST' and not test_start_time: test_start_time = parse_jira_date(history.created)
+                                if item.fromString == 'TEST' and test_start_time and not test_end_time: test_end_time = parse_jira_date(history.created)
                     if test_start_time and test_end_time:
                         qa_cycle_time.observe(business_hours_between(test_start_time, test_end_time) / 8)
 
